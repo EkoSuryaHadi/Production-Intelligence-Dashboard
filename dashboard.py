@@ -94,8 +94,7 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
 body{background:#0d1117;color:#c9d1d9;font-family:'IBM Plex Sans',sans-serif;}
 .stApp{background:#0d1117;}
-label p {color: #c9d1d9 !important;}
-label {color: #c9d1d9 !important;}
+label p, label, summary, summary * {color: #c9d1d9 !important;}
 .sec-hdr{font-size:17px;font-weight:600;color:#f0f6fc;letter-spacing:.05em;border-bottom:2px solid #f0a500;padding-bottom:10px;margin:26px 0 10px;}
 .page-hero{background:linear-gradient(135deg, rgba(88,166,255,.16), rgba(240,165,0,.08) 58%, rgba(13,17,23,.96));border:1px solid #21262d;border-radius:18px;padding:24px 26px 22px;margin:4px 0 18px;box-shadow:0 18px 60px rgba(0,0,0,.24);}
 .hero-kicker{font-size:11px;color:#f0a500;letter-spacing:.18em;text-transform:uppercase;margin-bottom:10px;font-weight:600;}
@@ -628,18 +627,146 @@ def compute_composite_scores(df, models, gfcols, fcols_pw, metrics,
     return results
 
 
+# =============================================================================
+# 🔧 WORKOVER SCORING ENGINE
+# =============================================================================
+
+def compute_workover_scores(df, window_days=90):
+    results = []
+    cutoff = pd.to_datetime(df["date"]).max() - pd.Timedelta(days=window_days)
+
+    for well in sorted(df["well"].unique()):
+        wd = df[df["well"] == well].copy()
+        wd["date"] = pd.to_datetime(wd["date"])
+        wd = wd.sort_values("date")
+
+        rec = wd[(wd["date"] >= cutoff) & (wd["is_shutdown"] == 0)].copy()
+        if len(rec) < 14:
+            rec = wd[wd["is_shutdown"] == 0].tail(30).copy()
+
+        t = np.arange(len(rec), dtype=float)
+
+        # 1. Decline score (30%)
+        if len(rec) >= 7:
+            slope_g, _ = np.polyfit(t, rec["gross"].values, 1)
+            mean_g = rec["gross"].mean()
+            ann_dcl_pct = float(-slope_g / mean_g * 365 * 100) if mean_g > 0 else 0.0
+            dcl_s = float(np.clip(ann_dcl_pct / 50 * 100, 0, 100))
+        else:
+            ann_dcl_pct = 0.0
+            dcl_s = 0.0
+
+        # 2. WC score (25%) — level + rising trend
+        last_wc = float(rec["wc"].iloc[-1]) if len(rec) > 0 else 0.0
+        if len(rec) >= 14:
+            slope_wc, _ = np.polyfit(t, rec["wc"].values, 1)
+            ann_wc_slope = float(slope_wc * 365)
+        else:
+            ann_wc_slope = 0.0
+        wc_level_s = float(np.clip(last_wc, 0, 100))
+        wc_trend_s = float(np.clip(ann_wc_slope / 20 * 100, 0, 100))
+        wc_s = wc_level_s * 0.5 + wc_trend_s * 0.5
+
+        # 3. Production gap score (25%) — gap from P90 peak
+        all_active = wd[wd["is_shutdown"] == 0]["gross"]
+        peak_gross = float(all_active.quantile(0.90)) if len(all_active) > 30 else float(all_active.max())
+        current_gross = float(rec["gross"].tail(7).mean()) if len(rec) >= 7 else float(rec["gross"].mean())
+        gap_pct = float((peak_gross - current_gross) / peak_gross * 100) if peak_gross > 0 else 0.0
+        gap_s = float(np.clip(gap_pct, 0, 100))
+
+        # 4. ESP health score (20%) — ampere + fluid level (K1/K5) else THP proxy
+        has_amp = rec["ampere"].notna().sum() > 10
+        if has_amp:
+            amp_vals = rec["ampere"].ffill().values.astype(float)
+            fl_vals  = rec["fl_dyn"].ffill().values.astype(float)
+            if len(amp_vals) >= 14:
+                slope_amp, _ = np.polyfit(t, amp_vals, 1)
+                mean_amp = amp_vals.mean()
+                amp_s = float(np.clip(slope_amp / mean_amp * 365 * 100 / 10 * 100, 0, 100)) if mean_amp > 0 else 0.0
+            else:
+                amp_s = 0.0
+            valid_fl = fl_vals[~np.isnan(fl_vals)]
+            if len(valid_fl) >= 14:
+                t_fl = t[~np.isnan(fl_vals)]
+                slope_fl, _ = np.polyfit(t_fl, valid_fl, 1)
+                mean_fl = valid_fl.mean()
+                fl_s = float(np.clip(slope_fl / mean_fl * 365 * 100 / 20 * 100, 0, 100)) if mean_fl > 0 else 0.0
+            else:
+                fl_s = 0.0
+            esp_s = amp_s * 0.6 + fl_s * 0.4
+        else:
+            thp_valid = rec["thp"].notna().sum()
+            if len(rec) >= 14 and thp_valid > 10:
+                thp_vals = rec["thp"].ffill().values.astype(float)
+                slope_thp, _ = np.polyfit(t, thp_vals, 1)
+                mean_thp = thp_vals.mean()
+                esp_s = float(np.clip(-slope_thp / mean_thp * 365 * 100 / 20 * 100, 0, 100)) if mean_thp > 0 else 0.0
+            else:
+                esp_s = 0.0
+
+        composite = round(dcl_s * 0.30 + wc_s * 0.25 + gap_s * 0.25 + esp_s * 0.20, 1)
+
+        if composite >= 60:
+            tier, tier_color = "PRIME", "#f85149"
+        elif composite >= 40:
+            tier, tier_color = "CANDIDATE", "#ffa657"
+        elif composite >= 20:
+            tier, tier_color = "MONITOR", "#f0a500"
+        else:
+            tier, tier_color = "STABLE", "#3fb950"
+
+        uplift_bopd  = max(0.0, peak_gross - current_gross)
+        econ_musd_yr = round(uplift_bopd * 70 * 365 / 1e6, 2)
+
+        actions = {
+            "PRIME":     ("Jadwalkan workover segera, evaluasi kandidat ESP baru",
+                          "Schedule workover immediately, evaluate ESP replacement"),
+            "CANDIDATE": ("Siapkan justifikasi teknis, evaluasi opsi stimulasi",
+                          "Prepare technical justification, evaluate stimulation options"),
+            "MONITOR":   ("Monitor trend 3 bulan, perbarui analisis decline",
+                          "Monitor trend 3 months, update decline analysis"),
+            "STABLE":    ("Sumur stabil — lanjutkan pemantauan rutin",
+                          "Well stable — continue routine monitoring"),
+        }
+        action_id, action_en = actions[tier]
+
+        results.append({
+            "well":          well,
+            "composite":     composite,
+            "tier":          tier,
+            "tier_color":    tier_color,
+            "dcl_s":         round(dcl_s, 1),
+            "wc_s":          round(wc_s, 1),
+            "gap_s":         round(gap_s, 1),
+            "esp_s":         round(esp_s, 1),
+            "ann_dcl_pct":   round(ann_dcl_pct, 1),
+            "last_wc":       round(last_wc, 1),
+            "ann_wc_slope":  round(ann_wc_slope, 1),
+            "current_gross": round(current_gross, 0),
+            "peak_gross":    round(peak_gross, 0),
+            "gap_pct":       round(gap_pct, 1),
+            "uplift_bopd":   round(uplift_bopd, 0),
+            "econ_musd_yr":  econ_musd_yr,
+            "action_id":     action_id,
+            "action_en":     action_en,
+        })
+
+    results.sort(key=lambda x: x["composite"], reverse=True)
+    return results
+
 
 sel_wells = sorted(df["well"].unique())
 lang_mode = st.sidebar.segmented_control("Bahasa / Language", options=["ID", "EN", "ID/EN"], default="ID/EN")
 page = st.sidebar.radio(
     lang_text("Navigasi", "Navigation"),
-    ["overview", "well", "ml", "dca", "priority"],
+    ["overview", "well", "ml", "dca", "priority", "workover"],
     format_func=lambda key: {
         "overview":  f"📊 {lang_text('Ringkasan Lapangan', 'Field Overview')}",
         "well":      f"⚡ {lang_text('Performa Sumur', 'Well Performance')}",
         "ml":        f"🤖 {lang_text('Prediksi ML', 'ML Prediction')}",
         "dca":       f"📉 {lang_text('DCA & Ekonomi', 'DCA & Economics')}",
         "priority":  f"🎯 {lang_text('Prioritas Sumur', 'Well Prioritization')}",
+        "workover":  f"🔧 {lang_text('Workover Ranking', 'Workover Ranking')}",
     }[key],
 )
 latest = df.sort_values("date").groupby("well").last().reset_index()
@@ -651,6 +778,11 @@ SCORE_KEYS   = ["resid_score","mape_score","esp_score",
                 "dcl_score","wc_score","slope_score"]
 SCORE_COLORS = ["#58a6ff","#7ee787","#d2a8ff","#f85149","#ffa657","#f0a500"]
 SCORE_WEIGHTS= [0.30, 0.10, 0.20, 0.20, 0.10, 0.10]
+
+WO_LABELS  = ["Decline Rate", "Water Cut", "Production Gap", "ESP Health"]
+WO_KEYS    = ["dcl_s", "wc_s", "gap_s", "esp_s"]
+WO_COLORS  = ["#f85149", "#ffa657", "#58a6ff", "#d2a8ff"]
+WO_WEIGHTS = [0.30, 0.25, 0.25, 0.20]
 
 # 1️⃣ FIELD OVERVIEW
 if page == "overview":
@@ -1717,4 +1849,295 @@ elif page == "priority":
         "Bobot dapat disesuaikan dengan preferensi operasional spesifik lapangan.",
         "Scores are recalculated every 5 minutes. All signals use the latest DPR data. "
         "Weights can be adjusted to match field-specific operational preferences."
+    ))
+
+# =============================================================================
+# 6️⃣ WORKOVER RANKING
+# =============================================================================
+elif page == "workover":
+
+    @st.cache_data(ttl=300)
+    def _cached_wo():
+        return compute_workover_scores(df)
+
+    wo_scores = _cached_wo()
+
+    render_page_intro(
+        lang_text("Workover Ranking", "Workover Ranking"),
+        lang_text("Kandidat Workover & Estimasi Nilai Ekonomi",
+                  "Workover Candidates & Economic Value Estimate"),
+        lang_text(
+            "Scoring otomatis kandidat workover berdasarkan decline rate, "
+            "tren water cut, gap produksi dari peak historis, dan kesehatan ESP.",
+            "Automated workover candidate scoring based on decline rate, "
+            "water cut trend, production gap from historical peak, and ESP health.",
+        ),
+        [
+            lang_text("4 sinyal · weighted score", "4 signals · weighted score"),
+            lang_text("Window 90 hari terakhir", "Last 90-day window"),
+            lang_text("4 tier: Prime / Candidate / Monitor / Stable",
+                      "4 tiers: Prime / Candidate / Monitor / Stable"),
+        ],
+    )
+
+    # ── Methodology expander ─────────────────────────────────────
+    with st.expander(lang_text("📐 Metodologi scoring workover",
+                               "📐 Workover scoring methodology"), expanded=False):
+        descs_id = {
+            "dcl_s": "Annual decline rate dari regresi linear gross 90 hari (50%/thn = 100 poin)",
+            "wc_s":  "Level WC saat ini + laju kenaikan WC tahunan (gabungan 50:50)",
+            "gap_s": "Selisih antara produksi saat ini dan peak historis (P90)",
+            "esp_s": "Kenaikan arus ampere + kenaikan fluid level (K1/K5); penurunan THP (K3/K4)",
+        }
+        descs_en = {
+            "dcl_s": "Annual decline rate from 90-day gross linear regression (50%/yr = 100 pts)",
+            "wc_s":  "Current WC level + annual WC rise rate (50:50 combined)",
+            "gap_s": "Gap between current production and historical peak (P90)",
+            "esp_s": "Ampere rise + fluid level rise (K1/K5); THP decline as proxy (K3/K4)",
+        }
+        rows_exp = ""
+        for lbl, key, clr, w in zip(WO_LABELS, WO_KEYS, WO_COLORS, WO_WEIGHTS):
+            desc = lang_text(descs_id[key], descs_en[key])
+            rows_exp += (
+                f"<tr><td><span style='color:{clr};font-weight:bold;'>{lbl}</span></td>"
+                f"<td>{int(w*100)}%</td>"
+                f"<td style='color:#8b949e;'>{desc}</td></tr>"
+            )
+        st.markdown(
+            f"<table class='mtable'><thead><tr>"
+            f"<th>{lang_text('Sinyal','Signal')}</th>"
+            f"<th>{lang_text('Bobot','Weight')}</th>"
+            f"<th>{lang_text('Deskripsi','Description')}</th>"
+            f"</tr></thead><tbody>{rows_exp}</tbody></table>",
+            unsafe_allow_html=True,
+        )
+        tier_rows = ""
+        for rng, tier, clr, desc_id, desc_en in [
+            ("≥ 60", "PRIME",     "#f85149",
+             "Workover sangat direkomendasikan — jadwalkan segera",
+             "Workover strongly recommended — schedule immediately"),
+            ("40–59", "CANDIDATE", "#ffa657",
+             "Workover layak dipertimbangkan — siapkan justifikasi teknis",
+             "Workover worth considering — prepare technical justification"),
+            ("20–39", "MONITOR",   "#f0a500",
+             "Pantau 3–6 bulan, evaluasi ulang jika trend memburuk",
+             "Monitor 3–6 months, re-evaluate if trend worsens"),
+            ("< 20",  "STABLE",   "#3fb950",
+             "Sumur stabil, tidak perlu intervensi",
+             "Well is stable, no intervention needed"),
+        ]:
+            tier_rows += (
+                f"<tr><td>{rng}</td>"
+                f"<td><span style='color:{clr};font-weight:700;'>{tier}</span></td>"
+                f"<td style='color:#8b949e;'>{lang_text(desc_id, desc_en)}</td></tr>"
+            )
+        st.markdown(
+            f"<div style='margin-top:12px;'>"
+            f"<table class='mtable'><thead><tr>"
+            f"<th>{lang_text('Range','Range')}</th>"
+            f"<th>{lang_text('Tier','Tier')}</th>"
+            f"<th>{lang_text('Panduan','Guidance')}</th>"
+            f"</tr></thead><tbody>{tier_rows}</tbody></table></div>",
+            unsafe_allow_html=True,
+        )
+
+    # ── KPI summary ───────────────────────────────────────────────
+    n_prime      = sum(1 for w in wo_scores if w["tier"] == "PRIME")
+    n_candidate  = sum(1 for w in wo_scores if w["tier"] in ["PRIME", "CANDIDATE"])
+    total_uplift = sum(w["uplift_bopd"] for w in wo_scores)
+    total_econ   = sum(w["econ_musd_yr"] for w in wo_scores)
+
+    render_kpi_cards([
+        (lang_text("Kandidat Utama", "Prime Candidates"),
+         str(n_prime), lang_text("sumur", "wells"), ""),
+        (lang_text("Total Kandidat", "Total Candidates"),
+         str(n_candidate), lang_text("sumur", "wells"), ""),
+        (lang_text("Potensi Uplift", "Potential Uplift"),
+         f"{total_uplift:,.0f}", "BOPD",
+         f"<span class='delta-up'>≈ ${total_econ:.1f}M/yr @$70/bbl</span>"),
+    ], max_cols=3)
+
+    # ── Ranked cards ──────────────────────────────────────────────
+    st.markdown(
+        f"<div class='sec-hdr'>"
+        f"{lang_text('Ranking Kandidat Workover', 'Workover Candidate Ranking')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    card_cols = st.columns(len(wo_scores))
+    for col, res in zip(card_cols, wo_scores):
+        tier_lbl = lang_text(
+            {"PRIME": "Kandidat Utama", "CANDIDATE": "Kandidat",
+             "MONITOR": "Pantau", "STABLE": "Stabil"}[res["tier"]],
+            res["tier"],
+        )
+        action_txt = res["action_id"] if lang_mode in ["ID", "ID/EN"] else res["action_en"]
+        gap_arrow  = f"▼{res['gap_pct']:.0f}%" if res["gap_pct"] > 0 else f"▲{-res['gap_pct']:.0f}%"
+        with col:
+            st.markdown(
+                f"""<div class='kpi-card' style='border-top:3px solid {res["tier_color"]};'>
+                <div class='kpi-label'>{res["well"]}</div>
+                <div style='display:flex;align-items:baseline;gap:8px;margin:6px 0;'>
+                  <span class='kpi-value' style='font-size:36px;color:{res["tier_color"]};'>{res["composite"]}</span>
+                  <span class='kpi-unit'>/100</span>
+                </div>
+                <div style='display:inline-block;padding:3px 10px;border-radius:5px;
+                     background:{res["tier_color"]}22;border:1px solid {res["tier_color"]};
+                     color:{res["tier_color"]};font-family:IBM Plex Mono,monospace;
+                     font-size:11px;font-weight:700;letter-spacing:.1em;margin-bottom:10px;'>
+                  {tier_lbl}
+                </div>
+                <div style='font-size:11px;color:#6e7681;line-height:1.7;'>
+                  Peak: <span style='color:#c9d1d9;'>{res["peak_gross"]:.0f} BOPD</span><br>
+                  {lang_text("Saat ini","Current")}: <span style='color:#c9d1d9;'>{res["current_gross"]:.0f} BOPD</span>
+                  &nbsp;<span style='color:{res["tier_color"]};'>{gap_arrow}</span><br>
+                  WC: <span style='color:#c9d1d9;'>{res["last_wc"]:.1f}%</span>
+                  &nbsp;{res["ann_wc_slope"]:+.0f}%/yr<br>
+                  Uplift: <span style='color:#3fb950;'>+{res["uplift_bopd"]:.0f} BOPD</span>
+                  &nbsp;≈ ${res["econ_musd_yr"]:.1f}M/yr
+                </div>
+                <div style='margin-top:10px;font-size:11px;color:{res["tier_color"]};
+                     border-top:1px solid #21262d;padding-top:8px;'>
+                  {action_txt}
+                </div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+    # ── Charts ────────────────────────────────────────────────────
+    st.markdown(
+        f"<div class='sec-hdr'>"
+        f"{lang_text('Analisis Visual', 'Visual Analysis')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    col_bar, col_bubble = st.columns(2)
+
+    with col_bar:
+        fig_wo = go.Figure()
+        for sk, lbl, clr, w in zip(WO_KEYS, WO_LABELS, WO_COLORS, WO_WEIGHTS):
+            fig_wo.add_trace(go.Bar(
+                y=[r["well"] for r in reversed(wo_scores)],
+                x=[r[sk] * w for r in reversed(wo_scores)],
+                orientation="h",
+                name=f"{lbl} ({int(w*100)}%)",
+                marker_color=clr,
+                opacity=0.85,
+            ))
+        style_xy_figure(
+            fig_wo,
+            lang_text("Breakdown Workover Score", "Workover Score Breakdown"),
+            280,
+            xaxis_title=lang_text("Kontribusi skor", "Score contribution"),
+        )
+        fig_wo.update_layout(barmode="stack", xaxis_range=[0, 105])
+        st.plotly_chart(fig_wo, use_container_width=True)
+
+    with col_bubble:
+        fig_bub = go.Figure()
+        for res in wo_scores:
+            c = WELL_COLORS.get(res["well"], "#888888")
+            fig_bub.add_trace(go.Scatter(
+                x=[res["last_wc"]],
+                y=[res["gap_pct"]],
+                mode="markers+text",
+                marker=dict(
+                    size=max(14, res["composite"] / 3),
+                    color=res["tier_color"],
+                    opacity=0.85,
+                    line=dict(color="#0d1117", width=2),
+                ),
+                text=[res["well"]],
+                textposition="top center",
+                textfont=dict(color=c, size=11),
+                name=res["well"],
+                hovertemplate=(
+                    f"<b>{res['well']}</b><br>"
+                    f"WC: {res['last_wc']:.1f}%<br>"
+                    f"Gap: {res['gap_pct']:.1f}%<br>"
+                    f"Score: {res['composite']}"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+            ))
+        style_xy_figure(
+            fig_bub,
+            lang_text("Gap Produksi vs Water Cut (ukuran = score)",
+                      "Production Gap vs Water Cut (size = score)"),
+            280,
+            xaxis_title=lang_text("Water Cut saat ini (%)", "Current Water Cut (%)"),
+            yaxis_title=lang_text("Gap dari Peak (%)", "Gap from Peak (%)"),
+        )
+        st.plotly_chart(fig_bub, use_container_width=True)
+
+    render_chart_note(lang_text(
+        "Ukuran gelembung proporsional dengan workover score. "
+        "Sumur di kanan-atas (WC tinggi + gap besar) adalah kandidat paling potensial.",
+        "Bubble size is proportional to workover score. "
+        "Wells at top-right (high WC + large gap) are the strongest candidates.",
+    ))
+
+    # ── Detail table ──────────────────────────────────────────────
+    st.markdown(
+        f"<div class='sec-hdr'>"
+        f"{lang_text('Tabel Detail Kandidat', 'Candidate Detail Table')}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    hdr_labels = [
+        lang_text("Sumur", "Well"),
+        lang_text("Score", "Score"),
+        lang_text("Tier", "Tier"),
+        lang_text("Decline %/thn", "Decline %/yr"),
+        lang_text("WC %", "WC %"),
+        lang_text("WC slope/thn", "WC slope/yr"),
+        lang_text("Peak BOPD", "Peak BOPD"),
+        lang_text("Saat ini BOPD", "Current BOPD"),
+        lang_text("Gap %", "Gap %"),
+        lang_text("Uplift BOPD", "Uplift BOPD"),
+        lang_text("Nilai Ekon. M$/thn", "Econ. Value M$/yr"),
+        lang_text("Rekomendasi", "Recommendation"),
+    ]
+    hdr_html  = "".join(f"<th>{h}</th>" for h in hdr_labels)
+    rows_html = ""
+    for res in wo_scores:
+        tc       = res["tier_color"]
+        tier_lbl = lang_text(
+            {"PRIME": "Kandidat Utama", "CANDIDATE": "Kandidat",
+             "MONITOR": "Pantau", "STABLE": "Stabil"}[res["tier"]],
+            res["tier"],
+        )
+        rec     = res["action_id"] if lang_mode in ["ID", "ID/EN"] else res["action_en"]
+        gap_cls = "clr-bad" if res["gap_pct"] > 30 else ""
+        rows_html += (
+            f"<tr>"
+            f"<td>{badge(res['well'])}</td>"
+            f"<td><b style='color:{tc};font-family:IBM Plex Mono,monospace;'>{res['composite']}</b></td>"
+            f"<td><span style='color:{tc};font-weight:700;'>{tier_lbl}</span></td>"
+            f"<td class='clr-bad'>{res['ann_dcl_pct']:+.0f}%</td>"
+            f"<td>{res['last_wc']:.1f}%</td>"
+            f"<td>{res['ann_wc_slope']:+.0f}%</td>"
+            f"<td>{res['peak_gross']:.0f}</td>"
+            f"<td>{res['current_gross']:.0f}</td>"
+            f"<td class='{gap_cls}'>{res['gap_pct']:.0f}%</td>"
+            f"<td style='color:#3fb950;'>+{res['uplift_bopd']:.0f}</td>"
+            f"<td style='color:#3fb950;'>${res['econ_musd_yr']:.2f}M</td>"
+            f"<td style='color:#8b949e;font-size:11px;'>{rec}</td>"
+            f"</tr>"
+        )
+    st.markdown(
+        f"<table class='mtable'><thead><tr>{hdr_html}</tr></thead>"
+        f"<tbody>{rows_html}</tbody></table>",
+        unsafe_allow_html=True,
+    )
+    render_chart_note(lang_text(
+        "Peak produksi diestimasi dari persentil P90 data historis aktif. "
+        "Nilai ekonomi dihitung pada asumsi harga minyak $70/bbl. "
+        "Score dihitung ulang setiap 5 menit.",
+        "Peak production estimated from P90 of historical active data. "
+        "Economic value calculated at assumed oil price $70/bbl. "
+        "Scores recalculated every 5 minutes.",
     ))
